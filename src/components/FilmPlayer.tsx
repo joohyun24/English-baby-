@@ -1,5 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2 } from 'lucide-react';
+import {
+  Play,
+  Pause,
+  RotateCcw,
+  Volume2,
+  VolumeX,
+  Music,
+  Download,
+  Loader2,
+} from 'lucide-react';
 import type { BeatAudioData, BeatId, SceneConfig, StoryboardBeat } from '../types';
 import { computeBeatSubtitleCues } from '../utils/subtitleTiming';
 import { renderBeatFrame, renderEndCreditFrame } from '../utils/canvasRenderer';
@@ -18,6 +27,121 @@ const CANVAS_WIDTH = 1280;
 const CANVAS_HEIGHT = 720;
 const END_CREDIT_DURATION = 3;
 
+function base64DataUrlToArrayBuffer(dataUrl: string): ArrayBuffer {
+  const commaIdx = dataUrl.indexOf(',');
+  const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+// Gentle, copyright-free Web Audio background music & subtle scene SFX scheduler
+function scheduleAmbientSoundtrack(
+  ctx: AudioContext,
+  destination: AudioNode,
+  startAtCtxTime: number,
+  offsetSec: number,
+  totalDurationSec: number,
+  beatTimings: Array<{ beatId: BeatId; start: number; duration: number }>
+): Array<AudioNode> {
+  const createdNodes: Array<AudioNode> = [];
+  const masterMusicGain = ctx.createGain();
+  masterMusicGain.gain.value = 0.085;
+  masterMusicGain.connect(destination);
+  createdNodes.push(masterMusicGain);
+
+  // Calm Cmaj7 -> Am7 -> Fmaj7 -> G6 warm electric-piano arpeggio every 2s
+  const chords = [
+    [261.63, 329.63, 392.0, 493.88], // Cmaj7
+    [220.0, 261.63, 329.63, 392.0], // Am7
+    [174.61, 220.0, 261.63, 329.63], // Fmaj7
+    [196.0, 246.94, 293.66, 329.63], // G6
+  ];
+
+  const chordStep = 2.0;
+  const firstStep = Math.floor(offsetSec / chordStep);
+  const maxSteps = Math.ceil(totalDurationSec / chordStep);
+
+  for (let s = firstStep; s < maxSteps; s++) {
+    const chordTime = s * chordStep;
+    const when = startAtCtxTime + (chordTime - offsetSec);
+    if (when < startAtCtxTime - 0.1) continue;
+
+    const notes = chords[s % chords.length];
+    notes.forEach((freq, nIdx) => {
+      const noteStart = Math.max(startAtCtxTime, when + nIdx * 0.14);
+      const osc = ctx.createOscillator();
+      const noteGain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, noteStart);
+
+      noteGain.gain.setValueAtTime(0.0001, noteStart);
+      noteGain.gain.linearRampToValueAtTime(0.28, noteStart + 0.05);
+      noteGain.gain.exponentialRampToValueAtTime(0.001, noteStart + 1.75);
+
+      osc.connect(noteGain);
+      noteGain.connect(masterMusicGain);
+      osc.start(noteStart);
+      osc.stop(noteStart + 1.8);
+      createdNodes.push(osc);
+    });
+  }
+
+  // Subtle scene SFX cues (coffee splash in Problem beat, gentle doorway bell in Close beat)
+  for (const b of beatTimings) {
+    if (b.beatId === 'problem') {
+      const splashTime = b.start + b.duration * 0.54;
+      if (splashTime >= offsetSec) {
+        const when = startAtCtxTime + (splashTime - offsetSec);
+        // Gentle splash whoosh using filtered noise
+        const bufferSize = Math.floor(ctx.sampleRate * 0.35);
+        const noiseBuf = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+        const data = noiseBuf.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) {
+          data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+        }
+        const noiseSrc = ctx.createBufferSource();
+        noiseSrc.buffer = noiseBuf;
+        const filter = ctx.createBiquadFilter();
+        filter.type = 'bandpass';
+        filter.frequency.setValueAtTime(1100, when);
+        const sfxGain = ctx.createGain();
+        sfxGain.gain.setValueAtTime(0.09, when);
+        sfxGain.gain.exponentialRampToValueAtTime(0.001, when + 0.34);
+
+        noiseSrc.connect(filter);
+        filter.connect(sfxGain);
+        sfxGain.connect(destination);
+        noiseSrc.start(when);
+        createdNodes.push(noiseSrc);
+      }
+    }
+    if (b.beatId === 'turn' || b.beatId === 'close') {
+      const chimeTime = b.start + 0.15;
+      if (chimeTime >= offsetSec) {
+        const when = startAtCtxTime + (chimeTime - offsetSec);
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(b.beatId === 'turn' ? 587.33 : 659.25, when);
+        g.gain.setValueAtTime(0.001, when);
+        g.gain.linearRampToValueAtTime(0.045, when + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0005, when + 0.65);
+        osc.connect(g);
+        g.connect(destination);
+        osc.start(when);
+        osc.stop(when + 0.7);
+        createdNodes.push(osc);
+      }
+    }
+  }
+
+  return createdNodes;
+}
+
 export const FilmPlayer: React.FC<FilmPlayerProps> = ({
   beats,
   scene,
@@ -30,18 +154,32 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [musicEnabled, setMusicEnabled] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [decodedVersion, setDecodedVersion] = useState(0);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const decodedBuffersRef = useRef<Record<string, AudioBuffer>>({});
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const activeMusicNodesRef = useRef<Array<AudioNode>>([]);
   const rafRef = useRef<number | null>(null);
   const playStartTimeRef = useRef<number>(0);
   const playOffsetRef = useRef<number>(0);
   const currentPlayedBeatRef = useRef<string | null>(null);
+
+  const ensureAudioContext = useCallback(() => {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return null;
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioCtx();
+    }
+    return audioCtxRef.current;
+  }, []);
 
   const visibleBeats = useMemo(() => {
     if (activeBeatFilter === 'all') return beats;
@@ -74,17 +212,14 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
     return { items, filmDuration, totalDuration };
   }, [visibleBeats, audioMap, includeEndCredit]);
 
-  // Decode WAV data URLs into AudioBuffers whenever audioMap changes
+  // Decode WAV data URLs directly from base64 (avoids CSP fetch issues)
   useEffect(() => {
     let cancelled = false;
     const decodeAll = async () => {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!AudioCtx) return;
-      if (!audioCtxRef.current) {
-        audioCtxRef.current = new AudioCtx();
-      }
-      const ctx = audioCtxRef.current;
+      const ctx = ensureAudioContext();
+      if (!ctx) return;
 
+      let addedAny = false;
       for (const beat of beats) {
         const audio = audioMap[beat.id];
         if (!audio?.audioDataUrl) continue;
@@ -92,22 +227,39 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
         if (decodedBuffersRef.current[cacheKey]) continue;
 
         try {
-          const resp = await fetch(audio.audioDataUrl);
-          const arrayBuf = await resp.arrayBuffer();
+          const arrayBuf = base64DataUrlToArrayBuffer(audio.audioDataUrl);
           const decoded = await ctx.decodeAudioData(arrayBuf);
           if (!cancelled) {
             decodedBuffersRef.current[cacheKey] = decoded;
+            addedAny = true;
           }
-        } catch {
-          // Ignore individual decode issues cleanly
+        } catch (e) {
+          console.error('Audio decode error for beat', beat.id, e);
         }
+      }
+      if (addedAny && !cancelled) {
+        setDecodedVersion((v) => v + 1);
       }
     };
     decodeAll();
     return () => {
       cancelled = true;
     };
-  }, [beats, audioMap]);
+  }, [beats, audioMap, ensureAudioContext]);
+
+  const stopActiveMusic = useCallback(() => {
+    for (const node of activeMusicNodesRef.current) {
+      try {
+        if ('stop' in node && typeof (node as AudioScheduledSourceNode).stop === 'function') {
+          (node as AudioScheduledSourceNode).stop();
+        }
+        node.disconnect();
+      } catch {
+        // already stopped
+      }
+    }
+    activeMusicNodesRef.current = [];
+  }, []);
 
   const stopActiveAudio = useCallback(() => {
     if (activeSourceRef.current) {
@@ -121,7 +273,11 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
     currentPlayedBeatRef.current = null;
   }, []);
 
-  // Draw frame at a given time (seconds)
+  const stopAllSound = useCallback(() => {
+    stopActiveAudio();
+    stopActiveMusic();
+  }, [stopActiveAudio, stopActiveMusic]);
+
   const drawAtTime = useCallback(
     (t: number) => {
       const canvas = canvasRef.current;
@@ -164,18 +320,16 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
     [timeline, scene, includeEndCredit, isPlaying]
   );
 
-  // Redraw whenever paused and timeline/scene/filter changes
   useEffect(() => {
     drawAtTime(currentTime);
   }, [currentTime, drawAtTime]);
 
-  // Reset position when beat filter changes
   useEffect(() => {
-    stopActiveAudio();
+    stopAllSound();
     setIsPlaying(false);
     setCurrentTime(0);
     playOffsetRef.current = 0;
-  }, [activeBeatFilter, stopActiveAudio]);
+  }, [activeBeatFilter, stopAllSound]);
 
   const startBeatAudioAt = useCallback(
     (itemIndex: number, offsetInsideBeat: number) => {
@@ -195,7 +349,6 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
         ctx.resume();
       }
 
-      // Gently fit audio inside beat slot if slightly longer
       const playbackRate =
         buffer.duration > item.duration - 0.1
           ? Math.min(1.22, buffer.duration / (item.duration - 0.15))
@@ -216,6 +369,42 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
     [timeline.items, audioMap, isMuted, stopActiveAudio]
   );
 
+  // If newly decoded voice arrives while playing, trigger the current beat's voice right away
+  useEffect(() => {
+    if (isPlaying && !isMuted) {
+      currentPlayedBeatRef.current = null;
+    }
+  }, [decodedVersion, isPlaying, isMuted]);
+
+  // Manage background soundtrack while playing
+  useEffect(() => {
+    stopActiveMusic();
+    if (!isPlaying || isMuted || !musicEnabled) return;
+    const ctx = ensureAudioContext();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      ctx.resume();
+    }
+
+    const beatTimings = timeline.items.map((it) => ({
+      beatId: it.beat.id,
+      start: it.start,
+      duration: it.duration,
+    }));
+    activeMusicNodesRef.current = scheduleAmbientSoundtrack(
+      ctx,
+      ctx.destination,
+      ctx.currentTime,
+      playOffsetRef.current,
+      timeline.totalDuration,
+      beatTimings
+    );
+
+    return () => {
+      stopActiveMusic();
+    };
+  }, [isPlaying, isMuted, musicEnabled, timeline, ensureAudioContext, stopActiveMusic]);
+
   // Playback loop
   useEffect(() => {
     if (!isPlaying) {
@@ -231,7 +420,7 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
         setCurrentTime(timeline.totalDuration);
         setIsPlaying(false);
         playOffsetRef.current = 0;
-        stopActiveAudio();
+        stopAllSound();
         drawAtTime(timeline.totalDuration);
         return;
       }
@@ -266,24 +455,26 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
     drawAtTime,
     startBeatAudioAt,
     stopActiveAudio,
+    stopAllSound,
     onBeatChange,
   ]);
 
   useEffect(() => {
     return () => {
-      stopActiveAudio();
+      stopAllSound();
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [stopActiveAudio]);
+  }, [stopAllSound]);
 
   const togglePlay = async () => {
-    if (audioCtxRef.current?.state === 'suspended') {
-      await audioCtxRef.current.resume();
+    const ctx = ensureAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      await ctx.resume();
     }
     if (isPlaying) {
       playOffsetRef.current = currentTime;
       setIsPlaying(false);
-      stopActiveAudio();
+      stopAllSound();
     } else {
       const startAt = currentTime >= timeline.totalDuration - 0.05 ? 0 : currentTime;
       playOffsetRef.current = startAt;
@@ -293,8 +484,12 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
     }
   };
 
-  const handleRestart = () => {
-    stopActiveAudio();
+  const handleRestart = async () => {
+    const ctx = ensureAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+    stopAllSound();
     playOffsetRef.current = 0;
     currentPlayedBeatRef.current = null;
     setCurrentTime(0);
@@ -303,7 +498,7 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
 
   const handleScrub = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = Number(e.target.value);
-    stopActiveAudio();
+    stopAllSound();
     playOffsetRef.current = val;
     currentPlayedBeatRef.current = null;
     setCurrentTime(val);
@@ -316,8 +511,9 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
     const nextMuted = !isMuted;
     setIsMuted(nextMuted);
     if (nextMuted) {
-      stopActiveAudio();
+      stopAllSound();
     } else if (isPlaying) {
+      playOffsetRef.current = currentTime;
       currentPlayedBeatRef.current = null;
     }
   };
@@ -328,7 +524,7 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
 
     setExportError(null);
     setIsPlaying(false);
-    stopActiveAudio();
+    stopAllSound();
     setIsExporting(true);
     setExportProgress(0);
 
@@ -339,13 +535,13 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
       const exportCtx = new AudioCtx();
       const dest = exportCtx.createMediaStreamDestination();
 
-      // Schedule all beat audio buffers cleanly on the export MediaStreamDestination
+      // Schedule TTS voices
       for (const item of timeline.items) {
         const audio = audioMap[item.beat.id];
         if (!audio?.audioDataUrl) continue;
         try {
-          const resp = await fetch(audio.audioDataUrl);
-          const buf = await exportCtx.decodeAudioData(await resp.arrayBuffer());
+          const arrayBuf = base64DataUrlToArrayBuffer(audio.audioDataUrl);
+          const buf = await exportCtx.decodeAudioData(arrayBuf);
           const src = exportCtx.createBufferSource();
           src.buffer = buf;
           const playbackRate =
@@ -356,8 +552,24 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
           src.connect(dest);
           src.start(exportCtx.currentTime + item.start);
         } catch {
-          // continue even if one audio segment fails
+          // continue cleanly
         }
+      }
+
+      // Schedule ambient music + SFX into downloaded video if enabled
+      if (musicEnabled) {
+        scheduleAmbientSoundtrack(
+          exportCtx,
+          dest,
+          exportCtx.currentTime,
+          0,
+          timeline.totalDuration,
+          timeline.items.map((it) => ({
+            beatId: it.beat.id,
+            start: it.start,
+            duration: it.duration,
+          }))
+        );
       }
 
       const canvasStream = canvas.captureStream(30);
@@ -480,7 +692,7 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
           <button
             type="button"
             onClick={togglePlay}
-            aria-label="Play video"
+            aria-label="Play video with sound"
             className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/30 transition-colors cursor-pointer"
           >
             <span className="flex items-center justify-center w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-white text-[#181C20] shadow-lg transition-transform hover:scale-105">
@@ -492,7 +704,7 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
         {isExporting && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 text-white px-6 text-center">
             <Loader2 className="w-10 h-10 animate-spin mb-3" />
-            <p className="text-lg font-semibold">Recording your 30s film with voice & subtitles…</p>
+            <p className="text-lg font-semibold">Recording your 30s film with voice, music & subtitles…</p>
             <p className="font-mono-num text-sm text-white/80 mt-1">{exportProgress}% complete</p>
           </div>
         )}
@@ -513,7 +725,7 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
             onChange={handleScrub}
             disabled={isExporting}
             aria-label="Video timeline scrubber"
-            className="flex-1 h-2 bg-[#E2E6EC] rounded-lg accent-[#2F4858] cursor-pointer"
+            className="flex-1 h-2 bg-[#E2E6EC] rounded-lg accent-[#2563EB] cursor-pointer"
           />
           <span className="font-mono-num text-sm font-medium text-[#4A5568] w-12 text-right">
             {formatTime(timeline.totalDuration)}
@@ -521,12 +733,12 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={togglePlay}
               disabled={isExporting}
-              className="min-h-[48px] px-5 py-2.5 rounded-xl bg-[#2F4858] hover:bg-[#243946] text-white font-semibold text-base flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+              className="min-h-[48px] px-5 py-2.5 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-semibold text-base flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
             >
               {isPlaying ? (
                 <>
@@ -556,10 +768,30 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
               type="button"
               onClick={toggleMute}
               disabled={isExporting}
-              aria-label={isMuted ? 'Unmute voice' : 'Mute voice'}
-              className="min-h-[48px] min-w-[48px] px-3.5 py-2.5 rounded-xl bg-[#F0F3F6] hover:bg-[#E2E7ED] text-[#1E242B] flex items-center justify-center transition-colors cursor-pointer disabled:opacity-50"
+              aria-label={isMuted ? 'Unmute sound' : 'Mute sound'}
+              className={`min-h-[48px] px-3.5 py-2.5 rounded-xl flex items-center gap-1.5 font-medium text-sm transition-colors cursor-pointer disabled:opacity-50 ${
+                isMuted
+                  ? 'bg-[#FEE2E2] text-[#991B1B]'
+                  : 'bg-[#F0F3F6] hover:bg-[#E2E7ED] text-[#1E242B]'
+              }`}
             >
               {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+              <span className="hidden sm:inline">{isMuted ? 'Muted' : 'Sound On'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setMusicEnabled((v) => !v)}
+              disabled={isExporting}
+              aria-label={musicEnabled ? 'Disable background music' : 'Enable background music'}
+              className={`min-h-[48px] px-3.5 py-2.5 rounded-xl flex items-center gap-1.5 font-medium text-sm transition-colors cursor-pointer disabled:opacity-50 ${
+                musicEnabled
+                  ? 'bg-[#D1FAE5] text-[#065F46]'
+                  : 'bg-[#F0F3F6] text-[#5A6675]'
+              }`}
+            >
+              <Music className="w-4 h-4" />
+              <span>{musicEnabled ? 'Music + SFX On' : 'Voice Only'}</span>
             </button>
           </div>
 
@@ -568,7 +800,7 @@ export const FilmPlayer: React.FC<FilmPlayerProps> = ({
               type="button"
               onClick={handleDownloadVideo}
               disabled={isExporting}
-              className="min-h-[48px] px-6 py-2.5 rounded-xl bg-[#4A7C6F] hover:bg-[#3C675C] text-white font-semibold text-base flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+              className="min-h-[48px] px-6 py-2.5 rounded-xl bg-[#059669] hover:bg-[#047857] text-white font-semibold text-base flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
             >
               {isExporting ? (
                 <>

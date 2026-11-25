@@ -13,13 +13,14 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 app.use(express.json({ limit: '2mb' }));
 
-function getGeminiClient(): GoogleGenAI {
+function getGeminiClient(apiVersion?: string): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
   return new GoogleGenAI({
     apiKey,
+    ...(apiVersion ? { apiVersion } : {}),
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -578,92 +579,86 @@ app.post('/api/tts/beat', async (req: Request, res: Response) => {
     const hasB = lines.some((l) => l.speaker === 'B');
     const isDualSpeaker = hasA && hasB && charA !== charB;
 
-    const ai = getGeminiClient();
+    const ai = getGeminiClient('v1beta');
 
     let base64Audio: string | undefined;
 
     if (isDualSpeaker) {
-      const parts = lines.map((l) => {
+      const inputParts = lines.map((l) => {
         const speakerLabel = l.speaker === 'A' ? charA : charB;
         return {
+          type: 'text' as const,
           text: `${speakerLabel}: ${l.text.trim()}`,
-          speechMetadata: {
-            speaker: speakerLabel,
-            style:
-              l.speaker === 'A'
-                ? 'Warm, gentle, slightly surprised conversational tone, clear English pronunciation'
-                : 'Bright, sincere, expressive conversational tone, clear English pronunciation',
-          },
+          annotations: [
+            {
+              type: 'speech_metadata' as const,
+              speaker: speakerLabel,
+              style:
+                l.speaker === 'A'
+                  ? 'Warm, gentle, conversational tone, clear English pronunciation'
+                  : 'Bright, sincere, expressive conversational tone, clear English pronunciation',
+            },
+          ],
         };
       });
 
-      const response = await runWithTtsRetry(() =>
-        ai.models.generateContent({
+      const interaction = await runWithTtsRetry(() =>
+        ai.interactions.create({
           model: 'gemini-3.8-flash-tts',
-          contents: [{ role: 'user', parts }],
-          config: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              multiSpeakerVoiceConfig: {
-                speakerVoiceConfigs: [
-                  {
-                    speaker: charA,
-                    voiceConfig: {
-                      prebuiltVoiceConfig: { voiceName: 'Charon' },
-                    },
-                  },
-                  {
-                    speaker: charB,
-                    voiceConfig: {
-                      prebuiltVoiceConfig: { voiceName: 'Kore' },
-                    },
-                  },
-                ],
-              },
+          input: inputParts,
+          response_format: { type: 'audio' },
+          generation_config: {
+            speech_config: {
+              speakers: [
+                {
+                  speaker: charA,
+                  voice: 'Charon',
+                },
+                {
+                  speaker: charB,
+                  voice: 'Kore',
+                },
+              ],
             },
           },
         })
       );
 
-      base64Audio =
-        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      base64Audio = interaction.output_audio?.data;
     } else {
       const singleSpeaker = hasA ? 'A' : 'B';
       const combinedText = lines.map((l) => l.text.trim()).join(' ');
-      const response = await runWithTtsRetry(() =>
-        ai.models.generateContent({
+      const interaction = await runWithTtsRetry(() =>
+        ai.interactions.create({
           model: 'gemini-3.8-flash-lite-tts',
-          contents: [
+          input: [
             {
-              role: 'user',
-              parts: [
+              type: 'text',
+              text: combinedText,
+              annotations: [
                 {
-                  text: combinedText,
-                  speechMetadata: {
-                    style:
-                      singleSpeaker === 'A'
-                        ? 'Calm, warm, thoughtful male conversational English for learners'
-                        : 'Expressive, friendly, clear female conversational English for learners',
-                  },
+                  type: 'speech_metadata',
+                  style:
+                    singleSpeaker === 'A'
+                      ? 'Calm, warm, thoughtful male conversational English for learners'
+                      : 'Expressive, friendly, clear female conversational English for learners',
                 },
               ],
             },
           ],
-          config: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: singleSpeaker === 'A' ? 'Charon' : 'Kore',
-                },
+          response_format: { type: 'audio' },
+          generation_config: {
+            speech_config: [
+              {
+                language: 'en-US',
+                voice: singleSpeaker === 'A' ? 'Charon' : 'Kore',
               },
-            },
+            ],
           },
         })
       );
 
-      base64Audio =
-        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      base64Audio = interaction.output_audio?.data;
     }
 
     if (!base64Audio) {
